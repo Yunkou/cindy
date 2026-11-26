@@ -31,6 +31,7 @@ import { canonicalSkillPath, snapshotDisabledSkillLaunch, currentDisabledSkillLa
 import { LIBRARY_READ_ROOT, libraryNativeReadContext } from '../shared/library-native-read.js';
 import { completedPiResponsesMessage, type PiResponsesCompletion } from './responses-completion.js';
 import { piCacheRouteKey, type PiCacheCompatibility } from './cache-compatibility.js';
+import { encodeManifestUtf8 } from './manifest-encoding.js';
 import os from 'node:os';
 import path from 'node:path';
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -2681,9 +2682,18 @@ export class PiAgent extends BaseAgent {
         this.deps.logger.info?.('pi writeModelsJson done', { modelsJsonPath });
       } else {
         await fs.mkdir(agentHome, { recursive: true });
+        // Pi 用 UTF-8 解码 models.json。写盘显式给字节，不让平台或系统 ANSI 代码页
+        // 决定编码：Windows 代码页 936 会把「·」的 UTF-8 字节 C2 B7 读成「路」
+        // (E8 B7 AF)，模型显示名就此被改写(#12928)。写后读回逐字节校验——坏清单
+        // 宁可让这次会话失败，也不留给 Pi。
+        const modelsJsonBytes = encodeManifestUtf8(modelsJsonContent, 'models.json');
         // 控制面文件:显式 600,防同机其他用户读 BYOM baseUrl / provider 路由
         // (R5 安全审计 H-5)。
-        await fs.writeFile(modelsJsonPath, modelsJsonContent, { mode: 0o600 });
+        await fs.writeFile(modelsJsonPath, modelsJsonBytes, { mode: 0o600 });
+        const writtenModelsJson = await fs.readFile(modelsJsonPath);
+        if (!writtenModelsJson.equals(modelsJsonBytes)) {
+          throw new Error('[PI_MANIFEST_WRITE_MISMATCH] models.json on disk differs from the bytes written');
+        }
         await fs.writeFile(path.join(agentHome, 'pi-cache-compatibility.json'), cacheRequestRulesContent, { mode: 0o600 });
         await fs.writeFile(settingsJsonPath, settingsJsonContent, {
           mode: 0o600,

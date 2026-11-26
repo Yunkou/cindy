@@ -371,6 +371,37 @@ describe("Pi provider-aware model routing", () => {
     await existing.close();
   });
 
+  // #12928, unit: the Pi manifest is the only file Pi reads for its model list,
+  // and it travels as bytes. On a Chinese Windows host (ANSI code page 936) one
+  // mis-decode turns the UTF-8 bytes of 「·」 (C2 B7) into 「路」 (E8 B7 AF) and
+  // rewrites every model name. Assert the bytes on disk rather than a decoded
+  // string, so the case stays platform independent.
+  it('writes the Pi model manifest with the model name bytes unchanged', async () => {
+    const modelName = 'DeepSeek V4.1 Flash 1017 · OpenCode Go';
+    const agent = new PiAgent({
+      auth: { getState: async () => ({ authenticated: true }), triggerLogin: async () => ({ authenticated: true }),
+        logout: async () => {}, getAuthEnv: async () => ({}) },
+      runtimeConfig: { endpoint: 'http://127.0.0.1:9' }, binaryPath: path.join(agentHome, 'pi'),
+      logger: noopLogger, resolvePiAgentHome: () => agentHome,
+      resolvePiNativeProviders: async () => ({ providers: [{ id: 'magpie-local', sourceProviderId: 'magpie-local',
+        name: 'Magpie', baseUrl: 'http://127.0.0.1:3425/v1', api: 'openai-completions' as const,
+        models: [{ id: 'opencode-go/deepseek-v4.1-flash', name: modelName }] }], env: {} }),
+    });
+    const handle = await agent.startSession({ sessionId: 'manifest-utf8', workingDir: cwd,
+      model: 'opencode-go/deepseek-v4.1-flash', providerId: 'magpie-local' });
+    try {
+      const manifest = readFileSync(path.join(captured.env.PI_CODING_AGENT_DIR as string, 'models.json'));
+      expect(manifest.includes(Buffer.from([0xc2, 0xb7]))).toBe(true);
+      expect(manifest.includes(Buffer.from([0xe8, 0xb7, 0xaf]))).toBe(false);
+      const parsed = JSON.parse(manifest.toString('utf8')) as {
+        providers: Record<string, { models?: Array<{ id: string; name?: string }> }>;
+      };
+      expect(parsed.providers['magpie-local']?.models?.[0]?.name).toBe(modelName);
+    } finally {
+      await handle.close();
+    }
+  });
+
   // Standard: the actual Pi launch passes the host account to auth and both authenticated proxy scopes.
   it('binds the selected subscription account to the root and same-provider child proxy tokens', async () => {
     const account: NativeSubscriptionAccount = { id: 'fixture-b', configDir: '/fixture/.codex-b',
