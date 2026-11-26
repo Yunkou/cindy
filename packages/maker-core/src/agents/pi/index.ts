@@ -31,7 +31,7 @@ import { canonicalSkillPath, snapshotDisabledSkillLaunch, currentDisabledSkillLa
 import { LIBRARY_READ_ROOT, libraryNativeReadContext } from '../shared/library-native-read.js';
 import { completedPiResponsesMessage, type PiResponsesCompletion } from './responses-completion.js';
 import { piCacheRouteKey, type PiCacheCompatibility } from './cache-compatibility.js';
-import { encodeManifestUtf8 } from './manifest-encoding.js';
+import { countManifestCodePoints, encodeManifestUtf8 } from './manifest-encoding.js';
 import os from 'node:os';
 import path from 'node:path';
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -2673,19 +2673,33 @@ export class PiAgent extends BaseAgent {
         modelsJsonPath,
         providerKeys: Object.keys(providers),
       });
+      // #12928 定位自检:码点计数(不含字符本身),写盘前后各一次。写前有 U+8DEF
+      // 说明名字在上游就已经错了;只有 U+00B7 而写后有 U+8DEF 才说明损坏发生在
+      // 写出/读取环节。只打 debug,默认不可见。
+      const manifestCodePointsBefore = countManifestCodePoints(modelsJsonContent);
+      this.deps.logger.debug?.('pi models.json code points before write', {
+        modelsJsonPath,
+        codePoints: manifestCodePointsBefore,
+      });
       if (opts.fileOps) {
         await opts.fileOps.mkdirp(agentHome);
         // fileOps 远端写入内部已 umask 077(创建即 600,无 TOCTOU —— R5 H-1)。
         await opts.fileOps.writeFile(modelsJsonPath, modelsJsonContent);
         await opts.fileOps.writeFile(joinRemotePosixPath(agentHome, 'pi-cache-compatibility.json'), cacheRequestRulesContent);
         await opts.fileOps.writeFile(settingsJsonPath, settingsJsonContent);
+        if (manifestCodePointsBefore['U+8DEF']) {
+          this.deps.logger.warn?.('pi models.json contains U+8DEF (「路」) — see #12928', {
+            modelsJsonPath,
+            before: true,
+            codePointsBefore: manifestCodePointsBefore,
+          });
+        }
         this.deps.logger.info?.('pi writeModelsJson done', { modelsJsonPath });
       } else {
         await fs.mkdir(agentHome, { recursive: true });
-        // Pi 用 UTF-8 解码 models.json。写盘显式给字节，不让平台或系统 ANSI 代码页
-        // 决定编码：Windows 代码页 936 会把「·」的 UTF-8 字节 C2 B7 读成「路」
-        // (E8 B7 AF)，模型显示名就此被改写(#12928)。写后读回逐字节校验——坏清单
-        // 宁可让这次会话失败，也不留给 Pi。
+        // 显式 UTF-8 字节写出并读回逐字节校验:控制面文件宁可写失败,也不留一份被
+        // 改写过的清单。注意这一步修不了「名字在上游就已经错」(#12928) —— 那种情况
+        // 写出的字节和入参一致,校验会如实通过;定位靠上面那条码点统计。
         const modelsJsonBytes = encodeManifestUtf8(modelsJsonContent, 'models.json');
         // 控制面文件:显式 600,防同机其他用户读 BYOM baseUrl / provider 路由
         // (R5 安全审计 H-5)。
@@ -2693,6 +2707,17 @@ export class PiAgent extends BaseAgent {
         const writtenModelsJson = await fs.readFile(modelsJsonPath);
         if (!writtenModelsJson.equals(modelsJsonBytes)) {
           throw new Error('[PI_MANIFEST_WRITE_MISMATCH] models.json on disk differs from the bytes written');
+        }
+        // 写后对照:若写前没有 U+8DEF 而现在出现,损坏就发生在写出/读取这一层。
+        const manifestCodePointsAfter = countManifestCodePoints(writtenModelsJson.toString('utf8'));
+        if (manifestCodePointsAfter['U+8DEF'] || manifestCodePointsBefore['U+8DEF']) {
+          this.deps.logger.warn?.('pi models.json contains U+8DEF (「路」) — see #12928', {
+            modelsJsonPath,
+            before: Boolean(manifestCodePointsBefore['U+8DEF']),
+            after: Boolean(manifestCodePointsAfter['U+8DEF']),
+            codePointsBefore: manifestCodePointsBefore,
+            codePointsAfter: manifestCodePointsAfter,
+          });
         }
         await fs.writeFile(path.join(agentHome, 'pi-cache-compatibility.json'), cacheRequestRulesContent, { mode: 0o600 });
         await fs.writeFile(settingsJsonPath, settingsJsonContent, {
